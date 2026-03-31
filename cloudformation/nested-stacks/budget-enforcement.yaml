@@ -12,7 +12,7 @@ Parameters:
 
   MonthlyBudgetAmount:
     Type: Number
-    Default: "50"
+    Default: 50
     Description: >
       Total monthly budget cap in USD for this environment. Tiered alerts fire at 50%, 75%, and 90% of this amount, matching budget variance thresholds used in financial reporting,
 
@@ -36,5 +36,161 @@ Parameters:
       Cost center tag for financial reporting. Maps to your chart of accounts which is useful for chargeback or showback models.
 
 Conditions:
-  IsProd: !Equals [ !Ref Environment, prod ]
-  IsNotDev: !Not [ !Equals [ !Ref Environment, dev ] ]
+  IsProd: !Equals [ !Ref Environment, "prod" ]
+  IsNotDev: !Not [ !Equals [ !Ref Environment, "dev" ] ]
+
+Resources:
+  BudgetAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'budget-alerts-${Environment}'
+      DisplayName: !Sub 'Budget Alerts (${Environment})'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: CostCenter
+          Value: !Ref CostCenterTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BudgetAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: 
+        - !Ref BudgetAlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBudgetServiceToPublish
+            Effect: Allow
+            Principal: 
+              Service: "budgets.amazonaws.com"
+            Action: "sns:Publish"
+            Resource: !Ref BudgetAlertTopic
+          - Sid: AllowAccountToPublish
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: "sns:Publish"
+            Resource: !Ref BudgetAlertTopic
+
+# Budgets - 3 tier alerting 
+
+# Tier 1 - 50% threshold - warning level - forecasted spend exceeds 50% of monthly budget. This is an early warning to alert teams of potential overspend so they can investigate and take action if needed. Forecasted spend is used to provide visibility into potential future costs based on current trends.
+  BudgetTier1Warning:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${Environment}-budget-warning-50pct'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetAmount
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - !Sub 'user:Environment$${Environment}'
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+          IncludeRefund: false
+          IncludeCredit: false
+          IncludeUpfront: true
+          IncludeRecurring: true
+          IncludeOtherSubscription: true
+          IncludeSupport: true
+          IncludeDiscount: true
+          UseAmortized: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+
+
+# Tier 2 - 80% threshold - action required level - actual spend exceeds 80% of monthly budget. This indicates that the team is approaching the budget limit and should take immediate action to prevent overspending. Actual spend is used here to reflect the real costs incurred, prompting teams to review their usage and optimize resources if necessary. 
+  BudgetTier2ActionRequired:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${Environment}-budget-action-required-80pct'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetAmount
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - !Sub 'user:Environment$${Environment}'
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+          IncludeRefund: false
+          IncludeCredit: false
+          IncludeUpfront: true
+          IncludeRecurring: true
+          IncludeOtherSubscription: true
+          IncludeSupport: true
+          IncludeDiscount: true
+          UseAmortized: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic  
+
+# Tier 3 - 100% breach, triggers Lambda auto remediation
+  BudgetTier3Breach:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${Environment}-budget-breach-100pct'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetAmount
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - !Sub 'user:Environment$${Environment}'
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+          IncludeRefund: false
+          IncludeCredit: false
+          IncludeUpfront: true
+          IncludeRecurring: true
+          IncludeOtherSubscription: true
+          IncludeSupport: true
+          IncludeDiscount: true
+          UseAmortized: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic

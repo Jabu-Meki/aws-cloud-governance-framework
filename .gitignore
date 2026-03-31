@@ -5,8 +5,14 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
+.venv/
 venv/
+cfn-lint-env/
+.pytest_cache/
+.mypy_cache/
 
 cdk.out/
 node_modules/
@@ -18,4 +24,13 @@ node_modules/
 packaged-*.yaml
 samconfig.toml
 
+# Editors / local tooling
 .vscode/
+.idea/
+.codex
+
+# Terraform local state
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

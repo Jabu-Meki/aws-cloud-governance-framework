@@ -1,0 +1,6 @@
+{
+    "editor.autoIndent": "full",
+    "yaml.schemas": {
+        "https://raw.githubusercontent.com/awslabs/goformation/master/schema/cloudformation.schema.json": "file:///home/jabu/Documents/aws-cloud-governance-framework/cloudformation/nested-stacks/budget-enforcement.yaml"
+    }
+}

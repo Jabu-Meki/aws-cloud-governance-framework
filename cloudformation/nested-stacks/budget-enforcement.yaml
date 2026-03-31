@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Budget Enforcement Nested Stack - CLoud Cost Governance Framework Deploys tiered AWS Budgets with SNS alerts and Lambda auto-remediation. Tags are enforced via AWS Config rules. Designed for FinOps visibility across dev/staging/prod environments using cost allocation tags
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [ dev, staging, prod ]
+    Description: >
+      Deployment environment. Controls budget thresholds prod gets higher limits, dev gets tighter guardrails.
+
+  MonthlyBudgetAmount:
+    Type: Number
+    Default: "50"
+    Description: >
+      Total monthly budget cap in USD for this environment. Tiered alerts fire at 50%, 75%, and 90% of this amount, matching budget variance thresholds used in financial reporting,
+
+  AlertEmail:
+    Type: String
+    Description: >
+      Email address that receives budget breach notifications 
+    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address.
+
+  ProjectTag:
+    Type: String
+    Default: cloud-governance
+    Description: >
+      Value for the mandatory Project cost allocation tag. Every resource deployed by this stack carried this tag so spend is attributable.
+
+  CostCenterTag:
+    Type: String
+    Default: engineering
+    Description: >
+      Cost center tag for financial reporting. Maps to your chart of accounts which is useful for chargeback or showback models.
+
+Conditions:
+  IsProd: !Equals [ !Ref Environment, prod ]
+  IsNotDev: !Not [ !Equals [ !Ref Environment, dev ] ]

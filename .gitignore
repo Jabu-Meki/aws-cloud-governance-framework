@@ -1,0 +1,19 @@
+.aws/
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+cdk.out/
+node_modules/
+
+# macOS
+.DS_Store
+
+# Deployment artifacts
+packaged-*.yaml
+samconfig.toml

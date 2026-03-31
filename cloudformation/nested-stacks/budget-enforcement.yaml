@@ -194,3 +194,213 @@ Resources:
           Subscribers:
             - SubscriptionType: SNS
               Address: !Ref BudgetAlertTopic
+
+
+# IAM Role for Lambda
+
+  LambdaRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'budget-remediation-lambda-role-${Environment}'
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BudgetRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 Stop only, not terminate
+              - Sid: EC2StopInstances
+                Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Environment: !Ref Environment
+
+              - Sid: CostExplorerReadOnly
+                Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                  - ce:GetDimensionValues
+                  - ce:GetTags
+                Resource: "*"
+                
+              - Sid: SNSPublishAlerts
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BudgetAlertTopic
+
+              - Sid: CloudWatchLogsWrite
+                Effect: Allow
+                Action:
+                  -logs:CreateLogGroup
+                  -logs:CreateLogStream
+                  -logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/budget-remediation-${Environment}:*'
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+# Lambda function for auto-remediation on budget breach
+  BudgetRemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'budget-remediation-${Environment}'
+      Description: >
+        Stops EC2 instances tagged with the current environment when
+        a 100% budget breach is detected. Sends remediation summary to SNS.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRemediationRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !Ref BudgetAlertTopic
+          MONTHLY_BUDGET: !Ref MonthlyBudgetAmount
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          from datetime import datetime
+ 
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+ 
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+          ce  = boto3.client('ce')
+ 
+          ENVIRONMENT   = os.environ['ENVIRONMENT']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          MONTHLY_BUDGET = float(os.environ['MONTHLY_BUDGET'])
+ 
+          def get_current_spend():
+              """Pull month-to-date actual spend from Cost Explorer."""
+              today = datetime.utcnow()
+              start = today.replace(day=1).strftime('%Y-%m-%d')
+              end   = today.strftime('%Y-%m-%d')
+              response = ce.get_cost_and_usage(
+                  TimePeriod={'Start': start, 'End': end},
+                  Granularity='MONTHLY',
+                  Metrics=['UnblendedCost'],
+                  Filter={
+                      'Tags': {
+                          'Key': 'Environment',
+                          'Values': [ENVIRONMENT]
+                      }
+                  }
+              )
+              results = response['ResultsByTime']
+              if results:
+                  return float(results[0]['Total']['UnblendedCost']['Amount'])
+              return 0.0
+ 
+          def find_running_instances():
+              """Find all running EC2 instances tagged for this environment."""
+              response = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'instance-state-name', 'Values': ['running']},
+                      {'Name': f'tag:Environment',    'Values': [ENVIRONMENT]}
+                  ]
+              )
+              instance_ids = []
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_ids.append(instance['InstanceId'])
+              return instance_ids
+ 
+          def stop_instances(instance_ids):
+              """Stop instances. Returns list of successfully stopped instance IDs."""
+              if not instance_ids:
+                  return []
+              response = ec2.stop_instances(InstanceIds=instance_ids)
+              stopped = [i['InstanceId'] for i in response['StoppingInstances']]
+              logger.info(f"Stopped instances: {stopped}")
+              return stopped
+ 
+          def send_remediation_summary(stopped_instances, current_spend):
+              """Publish a clear, human-readable remediation summary to SNS."""
+              variance_pct = ((current_spend - MONTHLY_BUDGET) / MONTHLY_BUDGET) * 100
+              message = {
+                  'alert_type': 'BUDGET_BREACH_REMEDIATION',
+                  'environment': ENVIRONMENT,
+                  'timestamp': datetime.utcnow().isoformat() + 'Z',
+                  'budget_summary': {
+                      'monthly_budget_usd': MONTHLY_BUDGET,
+                      'current_spend_usd': round(current_spend, 4),
+                      'variance_usd': round(current_spend - MONTHLY_BUDGET, 4),
+                      'variance_pct': round(variance_pct, 2)
+                  },
+                  'remediation_action': {
+                      'action_taken': 'STOP_EC2_INSTANCES',
+                      'instances_stopped': stopped_instances,
+                      'instances_count': len(stopped_instances)
+                  },
+                  'next_steps': [
+                      'Review Cost Explorer for spend breakdown',
+                      'Investigate tagged resources for waste',
+                      'Restart instances manually after budget review'
+                  ]
+              }
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject=f'[{ENVIRONMENT.upper()}] Budget Breach — Auto-Remediation Executed',
+                  Message=json.dumps(message, indent=2)
+              )
+ 
+          def handler(event, context):
+              """
+              Entry point. Triggered by SNS budget breach notification.
+              1. Verify this is a genuine breach (not a test)
+              2. Get current spend from Cost Explorer
+              3. Stop tagged EC2 instances
+              4. Send remediation summary
+              """
+              logger.info(f"Budget breach event received: {json.dumps(event)}")
+ 
+              # Parse the SNS message to confirm it's a budget breach
+              for record in event.get('Records', []):
+                  message_body = record.get('Sns', {}).get('Message', '')
+                  if 'ALARM' not in message_body and 'budget' not in message_body.lower():
+                      logger.warning("Event does not appear to be a budget breach. Skipping.")
+                      return {'statusCode': 200, 'body': 'Not a budget breach event'}
+ 
+              current_spend   = get_current_spend()
+              instance_ids    = find_running_instances()
+              stopped         = stop_instances(instance_ids)
+              send_remediation_summary(stopped, current_spend)
+ 
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'instances_stopped': stopped,
+                      'current_spend': current_spend
+                  })
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+       

@@ -17,3 +17,5 @@ node_modules/
 # Deployment artifacts
 packaged-*.yaml
 samconfig.toml
+
+.vscode/

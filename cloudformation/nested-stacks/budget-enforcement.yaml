@@ -403,4 +403,265 @@ Resources:
           Value: !Ref Environment
         - Key: ManagedBy
           Value: CloudFormation
-       
+  
+# Lambda permission which allows SNS to invoke Lambda
+  LambdaSNSInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BudgetRemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BudgetAlertTopic
+
+# SNS subscription which wires Lambda to the alert topic.
+  LambdaSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BudgetAlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt BudgetRemediationLambda.Arn
+      FilterPolicy: 
+        # Only trigger Lambda on Tier 3 (100%) breach notifications
+        alert_type:
+          - BUDGET_BREACH 
+
+# CloudWatch Log Group
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/budget-remediation-${Environment}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# Config delivery channel.
+  ConfigDeliveryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'config-delivery-${AWS::AccountId}-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireConfigSnapshots
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy 
+          Value: CloudFormation
+
+  ConfigDeliveryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigDeliveryBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSConfigDeliveryPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+            Resource: !GetAtt ConfigDeliveryBucket.Arn
+          - Sid: AWSConfigBucketDelivery 
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${ConfigDeliveryBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+# IAM ROle for AWS Config service
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'config-service-role-${Environment}'
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# COnfig recorder.
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub 'config-recorder-${Environment}'
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        ResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::S3::Bucket
+          - AWS::IAM::Role
+          - AWS::Lambda::Function
+          - AWS::Budgets::Budget
+
+
+# Config delivery channel
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: ConfigDeliveryBucketPolicy
+    Properties:
+      Name: !Sub 'config-delivery-channel-${Environment}'
+      S3BucketName: !Ref ConfigDeliveryBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+# Config Rule - EC2 instances must have all three cost allocation tags
+ 
+  ConfigRuleMandatoryTags:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub 'ec2-required-tags-${Environment}'
+      Description: >
+        Ensures all EC2 instances have the mandatory cost allocation tags: Project and CostCenter. Non-compliant instances cannor be attributed to a cost center, breaking financial reporting.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters: 
+        {
+          "tag1Key": "Environment",
+          "tag2Key": "Project",
+          "tag3Key": "CostCenter"
+        }
+
+
+# COnfig Rule - S3 buckets must have all three cost allocation tags
+  ConfigRuleS3RequiredTags:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub 's3-required-tags-${Environment}'
+      Description: >
+        Ensures all S3 buckets have the mandatory cost allocation tags: Project and CostCenter. Non-compliant buckets cannor be attributed to a cost center, breaking financial reporting.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters: 
+        {
+          "tag1Key": "Environment",
+          "tag2Key": "Project",
+          "tag3Key": "CostCenter"
+        }
+
+# COnfig Rule - S3 buckets must not be publicly accessible
+  ConfigRuleS3PublicReadProhibited:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub 's3-block-public-access-${Environment}'
+      Description: >
+        Ensures S3 buckets are not publicly accessible. Public buckets can lead to data breaches and unexpected costs from unauthorized access.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED
+        
+# Cloudwatch alarm
+  ConfigComplianceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'config-compliance-detected-${Environment}'
+      AlarmDescription: >
+        Triggers if any AWS Config rule becomes non-compliant. This provides real-time visibility into compliance issues that could lead to cost overruns or security risks.
+      Namespace: AWS/Config
+      MetricName: NonCompliantRules
+      Dimensions:
+        - Name: AccountId
+          Value: !Ref ConfigRuleMandatoryTags
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BudgetAlertTopic
+      OKActions:
+        - !Ref BudgetAlertTopic
+
+
+# Outputs
+Outputs:
+ 
+  BudgetAlertTopicArn:
+    Description: ARN of the central SNS alert topic. Imported by other nested stacks.
+    Value: !Ref BudgetAlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetAlertTopicArn'
+ 
+  RemediationLambdaArn:
+    Description: ARN of the budget remediation Lambda function.
+    Value: !GetAtt BudgetRemediationLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationLambdaArn'
+ 
+  ConfigDeliveryBucketName:
+    Description: S3 bucket name for Config delivery. Imported by logging-audit stack.
+    Value: !Ref ConfigDeliveryBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucketName'
+ 
+  ConfigRecorderName:
+    Description: Name of the Config recorder. Referenced by security-baseline stack.
+    Value: !Ref ConfigRecorder
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigRecorderName'
+ 
+  BudgetTier1Name:
+    Description: Name of the 50% warning budget.
+    Value: !Sub '${Environment}-budget-warning-50pct'
+ 
+  BudgetTier2Name:
+    Description: Name of the 80% action-required budget.
+    Value: !Sub '${Environment}-budget-action-required-80pct'
+ 
+  BudgetTier3Name:
+    Description: Name of the 100% breach budget.
+    Value: !Sub '${Environment}-budget-breach-100pct'

@@ -1,29 +1,49 @@
-AWSTemplateFormatVersion: "2010-09-09"
+AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Logging and Audit Nested Stack for Cloud Cost Governance Framework
-  It deploys cloudtrail, cloudwatch metric filters and alarms for critical security events
-  athena is added on top of cloudtrail logs for querying and analysis. S3 bucket is created for storing cloudtrail logs with lifecycle policies for cost optimization.
+  Logging & Audit Nested Stack — Cloud Cost Governance Framework
+  Deploys CloudTrail, CloudWatch metric filters and alarms for
+  critical security events, and an Athena query layer over S3
+  for cost and compliance reporting.
 
-# Parameters
+  Security events monitored:
+    - Root account login
+    - Console login without MFA
+    - IAM policy changes
+    - CloudTrail configuration changes
+    - Unauthorized API calls
+    - S3 bucket policy changes
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
 Parameters:
+
   Environment:
-    Type: String 
-    
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
   ProjectTag:
     Type: String
-    
+
   CostCenterTag:
     Type: String
-    
+
   AlertTopicArn:
     Type: String
-    
-# Resources
+    Description: >
+      SNS topic ARN exported by budget-enforcement stack.
+      All security alarms publish here so budget and security
+      alerts land in one place — one inbox, one response process.
+
+
+# RESOURCES
+
 Resources:
+
   AuditTrailBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub 'cloudtrail-logs-${Environment}-${AWS::AccountId}'
+      BucketName: !Sub 'cloudtrail-logs-${AWS::AccountId}-${Environment}'
       VersioningConfiguration:
         Status: Enabled
       BucketEncryption:
@@ -37,13 +57,11 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          - Id: "TransitionToIA"
-            Status: "Enabled"
+          - Id: TransitionToIA
+            Status: Enabled
             Transitions:
-              - StorageClass: "STANDARD_IA"
-                TransitionInDays: 90
-          - Id: "ExpireLogs"
-            Status: "Enabled"
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
             ExpirationInDays: 365
       Tags:
         - Key: Project
@@ -57,7 +75,7 @@ Resources:
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref AuditTrailBucket
-      PolicyDocument: 
+      PolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Sid: AWSCloudTrailAclCheck
@@ -74,19 +92,20 @@ Resources:
             Resource: !Sub '${AuditTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
             Condition:
               StringEquals:
-                s3:x-amz-acl: "bucket-owner-full-control"
+                's3:x-amz-acl': bucket-owner-full-control
           - Sid: DenyNonSSL
             Effect: Deny
-            Principal: "*"
-            Action: s3:*
-            Resource: 
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
               - !GetAtt AuditTrailBucket.Arn
               - !Sub '${AuditTrailBucket.Arn}/*'
             Condition:
               Bool:
-                aws:SecureTransport: false
+                'aws:SecureTransport': false
 
-# CloudWatch Log group for CloudTrail logs
+  # CloudWatch Log Group — CloudTrail streams here for real-time metric filters.
+  # Retention set to 90 days. Older logs live in S3 (much cheaper per GB).
   TrailLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -100,8 +119,8 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-# IAM ROle which allows cloudtrail to write to cloudwatch logs
-  CloudTrailCloudWatchRole:
+  # IAM role — allows CloudTrail to write to CloudWatch Logs
+  CloudTrailLogsRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'cloudtrail-to-cloudwatch-${Environment}'
@@ -122,7 +141,6 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !GetAtt TrailLogGroup.Arn
-
       Tags:
         - Key: Project
           Value: !Ref ProjectTag
@@ -131,7 +149,6 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-# CloudTrail Trail
   GovernanceTrail:
     Type: AWS::CloudTrail::Trail
     DependsOn: AuditTrailBucketPolicy
@@ -143,11 +160,10 @@ Resources:
       EnableLogFileValidation: true
       S3BucketName: !Ref AuditTrailBucket
       CloudWatchLogsLogGroupArn: !GetAtt TrailLogGroup.Arn
-      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchRole.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
       EventSelectors:
         - ReadWriteType: WriteOnly
           IncludeManagementEvents: true
-          
       Tags:
         - Key: Project
           Value: !Ref ProjectTag
@@ -156,10 +172,20 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-# Cloudwatch metric filters and alarms.
+  # ----------------------------------------------------------------------------
+  # 2. CLOUDWATCH METRIC FILTERS + ALARMS
+  # Each filter scans CloudTrail logs for a specific event pattern.
+  # When the pattern matches, a metric increments.
+  # When the metric crosses the threshold, an alarm fires to SNS.
+  #
+  # Think of these as automated audit flags — the kind an auditor would
+  # raise manually during a compliance review, now running 24/7 automatically.
+  # ----------------------------------------------------------------------------
 
-# Root account login attempts
-  RootLoginMetricFilter:
+  # --- 2a. Root account login ---
+  # Root login should never happen in a governed account.
+  # Any root activity is a red flag — either an attacker or someone bypassing controls.
+  RootLoginFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref TrailLogGroup
@@ -169,16 +195,18 @@ Resources:
         && $.userIdentity.invokedBy NOT EXISTS
         && $.eventType != "AwsServiceEvent" }
       MetricTransformations:
-        - MetricValue: '1'
+        - MetricName: RootLoginCount
           MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
-          MetricName: !Sub 'RootLoginFailures-${Environment}'
+          MetricValue: '1'
           DefaultValue: 0
 
   RootLoginAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub 'root-login-detected-${Environment}'
-      AlarmDescription: 'Alarm for failed root login attempts'
+      AlarmDescription: >
+        Root account login detected. This should never happen in a governed
+        account. Investigate immediately — check CloudTrail for source IP.
       Namespace: !Sub 'GovernanceFramework/${Environment}'
       MetricName: RootLoginCount
       Statistic: Sum
@@ -190,27 +218,29 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-# Console Login without MFA
+  # --- 2b. Console login without MFA ---
   ConsoleLoginNoMFAFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref TrailLogGroup
-      FilterName: !Sub 'console-login-without-mfa-${Environment}'
+      FilterName: !Sub 'console-login-no-mfa-${Environment}'
       FilterPattern: >-
         { $.eventName = "ConsoleLogin"
-        && $.userIdentity.type != "Root"
-        && $.userIdentity.type != "AssumedRole"}
+        && $.additionalEventData.MFAUsed != "Yes"
+        && $.userIdentity.type != "AssumedRole" }
       MetricTransformations:
-        - MetricValue: '1'
+        - MetricName: ConsoleLoginNoMFACount
           MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
-          MetricName: ConsoleLoginNoMFACount
+          MetricValue: '1'
           DefaultValue: 0
 
   ConsoleLoginNoMFAAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub 'console-login-without-mfa-${Environment}'
-      AlarmDescription: 'Alarm for console logins without MFA'
+      AlarmDescription: >
+        Console login without MFA detected. Violates MFA enforcement policy.
+        Identify the IAM user and enforce MFA immediately.
       Namespace: !Sub 'GovernanceFramework/${Environment}'
       MetricName: ConsoleLoginNoMFACount
       Statistic: Sum
@@ -222,7 +252,9 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-# IAM policy changes
+  # --- 2c. IAM policy changes ---
+  # IAM is the permission layer for everything. Attackers who gain a foothold
+  # immediately try to escalate IAM permissions — this catches that move.
   IAMPolicyChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -250,3 +282,317 @@ Resources:
           MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
           MetricValue: '1'
           DefaultValue: 0
+
+  IAMPolicyChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'iam-policy-change-detected-${Environment}'
+      AlarmDescription: >
+        IAM policy change detected. Review CloudTrail for full details.
+        Unexpected IAM changes are a primary indicator of privilege escalation.
+      Namespace: !Sub 'GovernanceFramework/${Environment}'
+      MetricName: IAMPolicyChangeCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+
+  # --- 2d. CloudTrail configuration changes ---
+  # First move of an attacker with account access: disable CloudTrail.
+  # This alarm catches any attempt to stop, delete, or modify the trail.
+  CloudTrailChangeFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: !Sub 'cloudtrail-change-${Environment}'
+      FilterPattern: >-
+        { $.eventSource = "cloudtrail.amazonaws.com"
+        && ($.eventName = "StopLogging"
+        || $.eventName = "DeleteTrail"
+        || $.eventName = "UpdateTrail"
+        || $.eventName = "PutEventSelectors") }
+      MetricTransformations:
+        - MetricName: CloudTrailChangeCount
+          MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  CloudTrailChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'cloudtrail-configuration-changed-${Environment}'
+      AlarmDescription: >
+        CloudTrail was modified. This could be an attempt to disable audit
+        logging. Treat as HIGH severity until verified.
+      Namespace: !Sub 'GovernanceFramework/${Environment}'
+      MetricName: CloudTrailChangeCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+
+  # --- 2e. Unauthorized API calls ---
+  # 5+ access denied errors in 5 minutes = something probing your account.
+  UnauthorizedAPIFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: !Sub 'unauthorized-api-calls-${Environment}'
+      FilterPattern: >-
+        { $.errorCode = "AccessDenied"
+        || $.errorCode = "UnauthorizedAccess" }
+      MetricTransformations:
+        - MetricName: UnauthorizedAPICallCount
+          MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  UnauthorizedAPIAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'unauthorized-api-calls-${Environment}'
+      AlarmDescription: >
+        5+ unauthorized API calls in 5 minutes. May indicate credential
+        misuse or automated probing. Check CloudTrail for source IP.
+      Namespace: !Sub 'GovernanceFramework/${Environment}'
+      MetricName: UnauthorizedAPICallCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+
+  # --- 2f. S3 bucket policy changes ---
+  # Tracks modifications to S3 bucket policies or ACLs.
+  # Classic data exfiltration move: make a bucket public.
+  S3PolicyChangeFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: !Sub 's3-policy-change-${Environment}'
+      FilterPattern: >-
+        { $.eventSource = "s3.amazonaws.com"
+        && ($.eventName = "PutBucketPolicy"
+        || $.eventName = "DeleteBucketPolicy"
+        || $.eventName = "PutBucketAcl"
+        || $.eventName = "PutBucketCors"
+        || $.eventName = "PutBucketLifecycle"
+        || $.eventName = "PutBucketReplication") }
+      MetricTransformations:
+        - MetricName: S3PolicyChangeCount
+          MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  S3PolicyChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 's3-policy-change-${Environment}'
+      AlarmDescription: >
+        S3 bucket policy or configuration changed. Verify the change was
+        authorized — unintended public exposure is a leading cause of breaches.
+      Namespace: !Sub 'GovernanceFramework/${Environment}'
+      MetricName: S3PolicyChangeCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+
+  # ----------------------------------------------------------------------------
+  # 3. ATHENA QUERY LAYER
+  # Athena lets you run SQL directly against CloudTrail logs in S3.
+  # No database to manage — pay per query, pennies per run.
+  # This is your FinOps and compliance reporting layer.
+  # Your accounting background lets you design reports engineers don't build.
+  # ----------------------------------------------------------------------------
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'athena-results-${AWS::AccountId}-${Environment}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Athena workgroup — scopes results to our bucket, enforces encryption,
+  # and enables per-workgroup cost tracking in Cost Explorer.
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub 'governance-${Environment}'
+      Description: >
+        Workgroup for governance queries — CloudTrail analysis,
+        cost reporting, and compliance investigations.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Glue database — the catalog Athena uses to understand the CloudTrail schema.
+  AuditGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'governance_audit_${Environment}'
+        Description: Glue catalog for CloudTrail logs queried via Athena.
+
+  # CloudTrail table — maps raw S3 log files to a queryable SQL schema.
+  # Uses partition projection so Athena knows where to find logs by date
+  # without needing manual partition maintenance.
+  CloudTrailGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AuditGlueDatabase
+      TableInput:
+        Name: cloudtrail_logs
+        Description: CloudTrail events partitioned by region and date
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          'projection.enabled': 'true'
+          'projection.region.type': enum
+          'projection.region.values': !Ref AWS::Region
+          'projection.year.type': integer
+          'projection.year.range': '2024,2030'
+          'projection.month.type': integer
+          'projection.month.range': '1,12'
+          'projection.day.type': integer
+          'projection.day.range': '1,31'
+          'storage.location.template': !Sub >-
+            s3://${AuditTrailBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/${!region}/${!year}/${!month}/${!day}
+        PartitionKeys:
+          - Name: region
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${AuditTrailBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/'
+          InputFormat: com.amazon.emr.cloudtrail.CloudTrailInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: com.amazon.emr.hive.serde.CloudTrailSerde
+          Columns:
+            - Name: eventversion
+              Type: string
+            - Name: useridentity
+              Type: struct<type:string,principalid:string,arn:string,accountid:string,username:string>
+            - Name: eventtime
+              Type: string
+            - Name: eventsource
+              Type: string
+            - Name: eventname
+              Type: string
+            - Name: awsregion
+              Type: string
+            - Name: sourceipaddress
+              Type: string
+            - Name: useragent
+              Type: string
+            - Name: errorcode
+              Type: string
+            - Name: errormessage
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: eventid
+              Type: string
+            - Name: eventtype
+              Type: string
+            - Name: readonly
+              Type: string
+            - Name: recipientaccountid
+              Type: string
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+
+  AuditTrailBucketName:
+    Description: S3 bucket containing all CloudTrail logs.
+    Value: !Ref AuditTrailBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditTrailBucket'
+
+  TrailLogGroupName:
+    Description: CloudWatch Log Group receiving real-time CloudTrail events.
+    Value: !Ref TrailLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TrailLogGroup'
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup name for governance queries.
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  AthenaResultsBucketName:
+    Description: S3 bucket storing Athena query results.
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucket'
+
+  GlueDatabaseName:
+    Description: Glue catalog database for Athena queries.
+    Value: !Ref AuditGlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  SampleAthenaQuery:
+    Description: Paste this into the Athena console to query recent IAM changes.
+    Value: !Sub >-
+      SELECT eventtime, useridentity.arn, eventname, sourceipaddress
+      FROM governance_audit_${Environment}.cloudtrail_logs
+      WHERE eventsource = 'iam.amazonaws.com'
+      ORDER BY eventtime DESC LIMIT 50;

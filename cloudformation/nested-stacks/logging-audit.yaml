@@ -172,19 +172,9 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  # ----------------------------------------------------------------------------
+  
   # 2. CLOUDWATCH METRIC FILTERS + ALARMS
-  # Each filter scans CloudTrail logs for a specific event pattern.
-  # When the pattern matches, a metric increments.
-  # When the metric crosses the threshold, an alarm fires to SNS.
-  #
-  # Think of these as automated audit flags — the kind an auditor would
-  # raise manually during a compliance review, now running 24/7 automatically.
-  # ----------------------------------------------------------------------------
-
-  # --- 2a. Root account login ---
-  # Root login should never happen in a governed account.
-  # Any root activity is a red flag — either an attacker or someone bypassing controls.
+  
   RootLoginFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -218,7 +208,7 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # --- 2b. Console login without MFA ---
+  #  2b. Console login without MFA
   ConsoleLoginNoMFAFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -252,9 +242,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # --- 2c. IAM policy changes ---
-  # IAM is the permission layer for everything. Attackers who gain a foothold
-  # immediately try to escalate IAM permissions — this catches that move.
+  #  2c. IAM policy changes 
+  
   IAMPolicyChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -301,9 +290,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # --- 2d. CloudTrail configuration changes ---
-  # First move of an attacker with account access: disable CloudTrail.
-  # This alarm catches any attempt to stop, delete, or modify the trail.
+  # --- 2d. CloudTrail configuration changes 
+ 
   CloudTrailChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -373,9 +361,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # --- 2f. S3 bucket policy changes ---
-  # Tracks modifications to S3 bucket policies or ACLs.
-  # Classic data exfiltration move: make a bucket public.
+  # --- 2f. S3 bucket policy changes 
+  
   S3PolicyChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -413,13 +400,7 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # ----------------------------------------------------------------------------
   # 3. ATHENA QUERY LAYER
-  # Athena lets you run SQL directly against CloudTrail logs in S3.
-  # No database to manage — pay per query, pennies per run.
-  # This is your FinOps and compliance reporting layer.
-  # Your accounting background lets you design reports engineers don't build.
-  # ----------------------------------------------------------------------------
 
   AthenaResultsBucket:
     Type: AWS::S3::Bucket
@@ -447,8 +428,7 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  # Athena workgroup — scopes results to our bucket, enforces encryption,
-  # and enables per-workgroup cost tracking in Cost Explorer.
+  # Athena workgroup 
   AthenaWorkgroup:
     Type: AWS::Athena::WorkGroup
     Properties:
@@ -473,7 +453,7 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  # Glue database — the catalog Athena uses to understand the CloudTrail schema.
+  # Glue database 
   AuditGlueDatabase:
     Type: AWS::Glue::Database
     Properties:
@@ -482,9 +462,7 @@ Resources:
         Name: !Sub 'governance_audit_${Environment}'
         Description: Glue catalog for CloudTrail logs queried via Athena.
 
-  # CloudTrail table — maps raw S3 log files to a queryable SQL schema.
-  # Uses partition projection so Athena knows where to find logs by date
-  # without needing manual partition maintenance.
+  # CloudTrail table .
   CloudTrailGlueTable:
     Type: AWS::Glue::Table
     Properties:
@@ -554,9 +532,7 @@ Resources:
             - Name: recipientaccountid
               Type: string
 
-# ==============================================================================
 # OUTPUTS
-# ==============================================================================
 Outputs:
 
   AuditTrailBucketName:

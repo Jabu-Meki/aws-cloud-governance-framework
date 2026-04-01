@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Logging and Audit Nested Stack for Cloud Cost Governance Framework
+  It deploys cloudtrail, cloudwatch metric filters and alarms for critical security events
+  athena is added on top of cloudtrail logs for querying and analysis. S3 bucket is created for storing cloudtrail logs with lifecycle policies for cost optimization.
+
+# Parameters
+Parameters:
+  Environment:
+    Type: String 
+    
+  ProjectTag:
+    Type: String
+    
+  CostCenterTag:
+    Type: String
+    
+  AlertTopicArn:
+    Type: String
+    
+# Resources
+Resources:
+  AuditTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudtrail-logs-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: "TransitionToIA"
+            Status: "Enabled"
+            Transitions:
+              - StorageClass: "STANDARD_IA"
+                TransitionInDays: 90
+          - Id: "ExpireLogs"
+            Status: "Enabled"
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AuditTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditTrailBucket
+      PolicyDocument: 
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AuditTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: "bucket-owner-full-control"
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: 
+              - !GetAtt AuditTrailBucket.Arn
+              - !Sub '${AuditTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+# CloudWatch Log group for CloudTrail logs
+  TrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${Environment}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# IAM ROle which allows cloudtrail to write to cloudwatch logs
+  CloudTrailCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'cloudtrail-to-cloudwatch-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt TrailLogGroup.Arn
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# CloudTrail Trail
+  GovernanceTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditTrailBucketPolicy
+    Properties:
+      TrailName: !Sub 'governance-trail-${Environment}'
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      S3BucketName: !Ref AuditTrailBucket
+      CloudWatchLogsLogGroupArn: !GetAtt TrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchRole.Arn
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+          
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# Cloudwatch metric filters and alarms.
+
+# Root account login attempts
+  RootLoginMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: !Sub 'root-login-${Environment}'
+      FilterPattern: >-
+        { $.userIdentity.type = "Root"
+        && $.userIdentity.invokedBy NOT EXISTS
+        && $.eventType != "AwsServiceEvent" }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
+          MetricName: !Sub 'RootLoginFailures-${Environment}'
+          DefaultValue: 0
+
+  RootLoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'root-login-detected-${Environment}'
+      AlarmDescription: 'Alarm for failed root login attempts'
+      Namespace: !Sub 'GovernanceFramework/${Environment}'
+      MetricName: RootLoginCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+
+# Console Login without MFA
+  ConsoleLoginNoMFAFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: !Sub 'console-login-without-mfa-${Environment}'
+      FilterPattern: >-
+        { $.eventName = "ConsoleLogin"
+        && $.userIdentity.type != "Root"
+        && $.userIdentity.type != "AssumedRole"}
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
+          MetricName: ConsoleLoginNoMFACount
+          DefaultValue: 0
+
+  ConsoleLoginNoMFAAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'console-login-without-mfa-${Environment}'
+      AlarmDescription: 'Alarm for console logins without MFA'
+      Namespace: !Sub 'GovernanceFramework/${Environment}'
+      MetricName: ConsoleLoginNoMFACount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopicArn
+
+# IAM policy changes
+  IAMPolicyChangeFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: !Sub 'iam-policy-change-${Environment}'
+      FilterPattern: >-
+        { $.eventSource = "iam.amazonaws.com"
+        && ($.eventName = "DeleteGroupPolicy"
+        || $.eventName = "DeleteRolePolicy"
+        || $.eventName = "DeleteUserPolicy"
+        || $.eventName = "PutGroupPolicy"
+        || $.eventName = "PutRolePolicy"
+        || $.eventName = "PutUserPolicy"
+        || $.eventName = "CreatePolicy"
+        || $.eventName = "DeletePolicy"
+        || $.eventName = "CreatePolicyVersion"
+        || $.eventName = "DeletePolicyVersion"
+        || $.eventName = "SetDefaultPolicyVersion"
+        || $.eventName = "AttachRolePolicy"
+        || $.eventName = "DetachRolePolicy"
+        || $.eventName = "AttachUserPolicy"
+        || $.eventName = "DetachUserPolicy") }
+      MetricTransformations:
+        - MetricName: IAMPolicyChangeCount
+          MetricNamespace: !Sub 'GovernanceFramework/${Environment}'
+          MetricValue: '1'
+          DefaultValue: 0

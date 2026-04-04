@@ -16,13 +16,6 @@ Parameters:
     Description: >
       Total monthly budget cap in USD for this environment. Tiered alerts fire at 50%, 75%, and 90% of this amount, matching budget variance thresholds used in financial reporting,
 
-  AlertEmail:
-    Type: String
-    Description: >
-      Email address that receives budget breach notifications 
-    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
-    ConstraintDescription: Must be a valid email address.
-
   ProjectTag:
     Type: String
     Default: cloud-governance
@@ -35,9 +28,14 @@ Parameters:
     Description: >
       Cost center tag for financial reporting. Maps to your chart of accounts which is useful for chargeback or showback models.
 
-Conditions:
-  IsProd: !Equals [ !Ref Environment, "prod" ]
-  IsNotDev: !Not [ !Equals [ !Ref Environment, "dev" ] ]
+  AlertEmail:
+    Type: String
+    Description: >
+      Email address for budget breach notifications.
+      You must confirm the SNS subscription after deployment.
+    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address.
+
 
 Resources:
   BudgetAlertTopic:
@@ -58,15 +56,21 @@ Resources:
   BudgetAlertTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Properties:
-      Topics: 
+      Topics:
         - !Ref BudgetAlertTopic
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Sid: AllowBudgetServiceToPublish
             Effect: Allow
-            Principal: 
+            Principal:
               Service: "budgets.amazonaws.com"
+            Action: "sns:Publish"
+            Resource: !Ref BudgetAlertTopic
+          - Sid: AllowEventBridgeToPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
             Action: "sns:Publish"
             Resource: !Ref BudgetAlertTopic
           - Sid: AllowAccountToPublish
@@ -76,9 +80,20 @@ Resources:
             Action: "sns:Publish"
             Resource: !Ref BudgetAlertTopic
 
-# Budgets - 3 tier alerting 
+  BudgetAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BudgetAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
 
-# Tier 1 - 50% threshold - warning level - forecasted spend exceeds 50% of monthly budget. This is an early warning to alert teams of potential overspend so they can investigate and take action if needed. Forecasted spend is used to provide visibility into potential future costs based on current trends.
+  # Budgets - 3 tier alerting
+
+  # Tier 1 - 50% threshold - warning level - forecasted spend exceeds 50% of
+  # monthly budget. This is an early warning to alert teams of potential
+  # overspend so they can investigate and take action if needed. Forecasted
+  # spend is used to provide visibility into potential future costs based on
+  # current trends.
   BudgetTier1Warning:
     Type: AWS::Budgets::Budget
     Properties:
@@ -115,7 +130,11 @@ Resources:
               Address: !Ref BudgetAlertTopic
 
 
-# Tier 2 - 80% threshold - action required level - actual spend exceeds 80% of monthly budget. This indicates that the team is approaching the budget limit and should take immediate action to prevent overspending. Actual spend is used here to reflect the real costs incurred, prompting teams to review their usage and optimize resources if necessary. 
+  # Tier 2 - 80% threshold - action required level - actual spend exceeds 80%
+  # of monthly budget. This indicates that the team is approaching the budget
+  # limit and should take immediate action to prevent overspending. Actual
+  # spend is used here to reflect the real costs incurred, prompting teams to
+  # review their usage and optimize resources if necessary.
   BudgetTier2ActionRequired:
     Type: AWS::Budgets::Budget
     Properties:
@@ -157,9 +176,9 @@ Resources:
             ThresholdType: PERCENTAGE
           Subscribers:
             - SubscriptionType: SNS
-              Address: !Ref BudgetAlertTopic  
+              Address: !Ref BudgetAlertTopic
 
-# Tier 3 - 100% breach, triggers Lambda auto remediation
+  # Tier 3 - 100% breach, triggers Lambda auto remediation
   BudgetTier3Breach:
     Type: AWS::Budgets::Budget
     Properties:
@@ -196,13 +215,13 @@ Resources:
               Address: !Ref BudgetAlertTopic
 
 
-# IAM Role for Lambda
+  # IAM role for Lambda
 
   LambdaRemediationRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'budget-remediation-lambda-role-${Environment}'
-      AssumeRolePolicyDocument: 
+      AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
@@ -234,7 +253,7 @@ Resources:
                   - ce:GetDimensionValues
                   - ce:GetTags
                 Resource: "*"
-                
+
               - Sid: SNSPublishAlerts
                 Effect: Allow
                 Action:
@@ -244,9 +263,9 @@ Resources:
               - Sid: CloudWatchLogsWrite
                 Effect: Allow
                 Action:
-                  -logs:CreateLogGroup
-                  -logs:CreateLogStream
-                  -logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/budget-remediation-${Environment}:*'
 
       Tags:
@@ -256,7 +275,7 @@ Resources:
           Value: !Ref Environment
         - Key: ManagedBy
           Value: CloudFormation
-# Lambda function for auto-remediation on budget breach
+  # Lambda function for auto-remediation on budget breach
   BudgetRemediationLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -281,18 +300,18 @@ Resources:
           import os
           import logging
           from datetime import datetime
- 
+
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
- 
+
           ec2 = boto3.client('ec2')
           sns = boto3.client('sns')
           ce  = boto3.client('ce')
- 
+
           ENVIRONMENT   = os.environ['ENVIRONMENT']
           SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
           MONTHLY_BUDGET = float(os.environ['MONTHLY_BUDGET'])
- 
+
           def get_current_spend():
               """Pull month-to-date actual spend from Cost Explorer."""
               today = datetime.utcnow()
@@ -313,7 +332,7 @@ Resources:
               if results:
                   return float(results[0]['Total']['UnblendedCost']['Amount'])
               return 0.0
- 
+
           def find_running_instances():
               """Find all running EC2 instances tagged for this environment."""
               response = ec2.describe_instances(
@@ -327,7 +346,7 @@ Resources:
                   for instance in reservation['Instances']:
                       instance_ids.append(instance['InstanceId'])
               return instance_ids
- 
+
           def stop_instances(instance_ids):
               """Stop instances. Returns list of successfully stopped instance IDs."""
               if not instance_ids:
@@ -336,7 +355,7 @@ Resources:
               stopped = [i['InstanceId'] for i in response['StoppingInstances']]
               logger.info(f"Stopped instances: {stopped}")
               return stopped
- 
+
           def send_remediation_summary(stopped_instances, current_spend):
               """Publish a clear, human-readable remediation summary to SNS."""
               variance_pct = ((current_spend - MONTHLY_BUDGET) / MONTHLY_BUDGET) * 100
@@ -366,7 +385,7 @@ Resources:
                   Subject=f'[{ENVIRONMENT.upper()}] Budget Breach — Auto-Remediation Executed',
                   Message=json.dumps(message, indent=2)
               )
- 
+
           def handler(event, context):
               """
               Entry point. Triggered by SNS budget breach notification.
@@ -376,19 +395,19 @@ Resources:
               4. Send remediation summary
               """
               logger.info(f"Budget breach event received: {json.dumps(event)}")
- 
+
               # Parse the SNS message to confirm it's a budget breach
               for record in event.get('Records', []):
                   message_body = record.get('Sns', {}).get('Message', '')
                   if 'ALARM' not in message_body and 'budget' not in message_body.lower():
                       logger.warning("Event does not appear to be a budget breach. Skipping.")
                       return {'statusCode': 200, 'body': 'Not a budget breach event'}
- 
+
               current_spend   = get_current_spend()
               instance_ids    = find_running_instances()
               stopped         = stop_instances(instance_ids)
               send_remediation_summary(stopped, current_spend)
- 
+
               return {
                   'statusCode': 200,
                   'body': json.dumps({
@@ -403,7 +422,7 @@ Resources:
           Value: !Ref Environment
         - Key: ManagedBy
           Value: CloudFormation
-  
+
 # Lambda permission which allows SNS to invoke Lambda
   LambdaSNSInvokePermission:
     Type: AWS::Lambda::Permission
@@ -420,10 +439,10 @@ Resources:
       TopicArn: !Ref BudgetAlertTopic
       Protocol: lambda
       Endpoint: !GetAtt BudgetRemediationLambda.Arn
-      FilterPolicy: 
+      FilterPolicy:
         # Only trigger Lambda on Tier 3 (100%) breach notifications
         alert_type:
-          - BUDGET_BREACH 
+          - BUDGET_BREACH
 
 # CloudWatch Log Group
   LambdaLogGroup:
@@ -465,7 +484,7 @@ Resources:
           Value: !Ref ProjectTag
         - Key: Environment
           Value: !Ref Environment
-        - Key: ManagedBy 
+        - Key: ManagedBy
           Value: CloudFormation
 
   ConfigDeliveryBucketPolicy:
@@ -480,11 +499,10 @@ Resources:
             Principal:
               Service: config.amazonaws.com
             Action:
-              - s3:PutObject
               - s3:GetBucketAcl
               - s3:GetBucketLocation
             Resource: !GetAtt ConfigDeliveryBucket.Arn
-          - Sid: AWSConfigBucketDelivery 
+          - Sid: AWSConfigBucketDelivery
             Effect: Allow
             Principal:
               Service: config.amazonaws.com
@@ -500,7 +518,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'config-service-role-${Environment}'
-      AssumeRolePolicyDocument: 
+      AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
@@ -526,12 +544,6 @@ Resources:
       RecordingGroup:
         AllSupported: true
         IncludeGlobalResourceTypes: true
-        ResourceTypes:
-          - AWS::EC2::Instance
-          - AWS::S3::Bucket
-          - AWS::IAM::Role
-          - AWS::Lambda::Function
-          - AWS::Budgets::Budget
 
 
 # Config delivery channel
@@ -545,7 +557,7 @@ Resources:
         DeliveryFrequency: TwentyFour_Hours
 
 # Config Rule - EC2 instances must have all three cost allocation tags
- 
+
   ConfigRuleMandatoryTags:
     Type: AWS::Config::ConfigRule
     DependsOn: ConfigRecorder
@@ -559,7 +571,7 @@ Resources:
       Source:
         Owner: AWS
         SourceIdentifier: REQUIRED_TAGS
-      InputParameters: 
+      InputParameters:
         {
           "tag1Key": "Environment",
           "tag2Key": "Project",
@@ -581,7 +593,7 @@ Resources:
       Source:
         Owner: AWS
         SourceIdentifier: REQUIRED_TAGS
-      InputParameters: 
+      InputParameters:
         {
           "tag1Key": "Environment",
           "tag2Key": "Project",
@@ -602,7 +614,7 @@ Resources:
       Source:
         Owner: AWS
         SourceIdentifier: S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED
-        
+
 # Cloudwatch alarm
   ConfigComplianceAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -629,39 +641,39 @@ Resources:
 
 # Outputs
 Outputs:
- 
+
   BudgetAlertTopicArn:
     Description: ARN of the central SNS alert topic. Imported by other nested stacks.
     Value: !Ref BudgetAlertTopic
     Export:
       Name: !Sub '${AWS::StackName}-BudgetAlertTopicArn'
- 
+
   RemediationLambdaArn:
     Description: ARN of the budget remediation Lambda function.
     Value: !GetAtt BudgetRemediationLambda.Arn
     Export:
       Name: !Sub '${AWS::StackName}-RemediationLambdaArn'
- 
+
   ConfigDeliveryBucketName:
     Description: S3 bucket name for Config delivery. Imported by logging-audit stack.
     Value: !Ref ConfigDeliveryBucket
     Export:
       Name: !Sub '${AWS::StackName}-ConfigBucketName'
- 
+
   ConfigRecorderName:
     Description: Name of the Config recorder. Referenced by security-baseline stack.
     Value: !Ref ConfigRecorder
     Export:
       Name: !Sub '${AWS::StackName}-ConfigRecorderName'
- 
+
   BudgetTier1Name:
     Description: Name of the 50% warning budget.
     Value: !Sub '${Environment}-budget-warning-50pct'
- 
+
   BudgetTier2Name:
     Description: Name of the 80% action-required budget.
     Value: !Sub '${Environment}-budget-action-required-80pct'
- 
+
   BudgetTier3Name:
     Description: Name of the 100% breach budget.
     Value: !Sub '${Environment}-budget-breach-100pct'

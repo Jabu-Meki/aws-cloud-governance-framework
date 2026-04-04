@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Cloud Cost Governance Framework — Master Stack
+  Orchestrates all nested stacks via a single deployment command.
+  Deploys: budget enforcement, security baseline, drift detection,
+  and logging/audit. All nested stacks share outputs via Exports.
+
+  Author: Jabu Meki
+  Repo:   github.com/jabu-meki/aws-cloud-governance-framework
+
+
+# METADATA
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - Environment
+          - ProjectTag
+          - CostCenterTag
+      - Label:
+          default: Budget & Cost Controls
+        Parameters:
+          - MonthlyBudgetLimit
+          - AlertEmail
+      - Label:
+          default: Deployment — S3 Artifact Bucket
+        Parameters:
+          - ArtifactBucketName
+
+    ParameterLabels:
+      Environment:
+        default: Deployment Environment
+      MonthlyBudgetLimit:
+        default: Monthly Budget Cap (USD)
+      AlertEmail:
+        default: Alert Notification Email
+      ProjectTag:
+        default: Project Cost Allocation Tag
+      CostCenterTag:
+        default: Cost Center Tag
+      ArtifactBucketName:
+        default: S3 Bucket Containing Nested Stack Templates
+
+
+# PARAMETERS
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: >
+      Deployment environment. Controls budget thresholds and
+      resource naming across all nested stacks.
+
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+    Description: >
+      Total monthly budget cap in USD. Tiered alerts fire at
+      50% (warning), 80% (action required), and 100% (auto-remediation).
+
+  AlertEmail:
+    Type: String
+    Description: >
+      Email address for all budget and security alerts.
+    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address.
+
+  ProjectTag:
+    Type: String
+    Default: cloud-governance
+    Description: >
+      Value applied to the Project tag on every resource in this stack.
+      Used for cost allocation and chargeback reporting.
+
+  CostCenterTag:
+    Type: String
+    Default: engineering
+    Description: >
+      Cost center identifier for financial reporting. Maps to your
+      chart of accounts. Used by AWS Cost Explorer tag-based filters.
+
+  ArtifactBucketName:
+    Type: String
+    Description: >
+      Name of the S3 bucket where nested stack YAML templates are stored.
+      Created in the pre-deployment step. 
+
+
+
+Resources:
+
+  
+  # STACK 1: Budget Enforcement
+
+  BudgetEnforcementStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::URLSuffix}/${AWS::Region}/nested-stacks/budget-enforcement.yaml'
+        - Bucket: !Ref ArtifactBucketName
+      TimeoutInMinutes: 30
+      Parameters:
+        Environment: !Ref Environment
+        MonthlyBudgetAmount: !Ref MonthlyBudgetLimit
+        AlertEmail: !Ref AlertEmail
+        ProjectTag: !Ref ProjectTag
+        CostCenterTag: !Ref CostCenterTag
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: StackLayer
+          Value: budget-enforcement
+
+  
+  # STACK 2: Logging & Audit
+  
+  LoggingAuditStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::URLSuffix}/${AWS::Region}/nested-stacks/logging-audit.yaml'
+        - Bucket: !Ref ArtifactBucketName
+      TimeoutInMinutes: 30
+      Parameters:
+        Environment: !Ref Environment
+        ProjectTag: !Ref ProjectTag
+        CostCenterTag: !Ref CostCenterTag
+        # Pass the SNS topic ARN exported by BudgetEnforcementStack
+        # so security alarms route to the same notification channel.
+        AlertTopicArn: !GetAtt BudgetEnforcementStack.Outputs.BudgetAlertTopicArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: StackLayer
+          Value: logging-audit
+
+  
+  # STACK 3: Security Baseline
+
+  SecurityBaselineStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::URLSuffix}/${AWS::Region}/nested-stacks/security-baseline.yaml'
+        - Bucket: !Ref ArtifactBucketName
+      TimeoutInMinutes: 30
+      Parameters:
+        Environment: !Ref Environment
+        ProjectTag: !Ref ProjectTag
+        CostCenterTag: !Ref CostCenterTag
+        AlertTopicArn: !GetAtt BudgetEnforcementStack.Outputs.BudgetAlertTopicArn
+        # Config recorder name so security stack can add rules without
+        # creating a second recorder (only one allowed per account per region)
+        ConfigBucketName: !GetAtt BudgetEnforcementStack.Outputs.ConfigDeliveryBucketName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: StackLayer
+          Value: security-baseline
+
+  # ----------------------------------------------------------------------------
+  # STACK 4: Drift Detection
+  # Deploys EventBridge scheduled rule + Lambda to detect CloudFormation
+  # stack drift on a daily schedule. Alerts route to the shared SNS topic.
+  # Also deploys a StackSet targeting us-east-1, us-west-2, eu-west-1
+  # to demonstrate multi-region governance awareness.
+  # Depends on: BudgetEnforcementStack (SNS topic)
+  # ----------------------------------------------------------------------------
+  DriftDetectionStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::URLSuffix}/${AWS::Region}/nested-stacks/drift-detection.yaml'
+        - Bucket: !Ref ArtifactBucketName
+      TimeoutInMinutes: 30
+      Parameters:
+        Environment: !Ref Environment
+        ProjectTag: !Ref ProjectTag
+        CostCenterTag: !Ref CostCenterTag
+        AlertTopicArn: !GetAtt BudgetEnforcementStack.Outputs.BudgetAlertTopicArn
+        # Pass master stack name so drift detector knows which stacks to monitor
+        MasterStackName: !Sub 'governance-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: StackLayer
+          Value: drift-detection
+
+
+# OUTPUTS
+
+Outputs:
+
+  StackName:
+    Description: Full name of this master stack.
+    Value: !Ref AWS::StackName
+
+  Environment:
+    Description: Deployed environment.
+    Value: !Ref Environment
+
+  AlertTopicArn:
+    Description: >
+      Central SNS alert topic ARN. All budget, security, and drift alerts
+      publish here. Subscribe additional endpoints (PagerDuty, Slack, etc)
+      to this ARN to extend notification coverage.
+    Value: !GetAtt BudgetEnforcementStack.Outputs.BudgetAlertTopicArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicArn'
+
+  RemediationLambdaArn:
+    Description: ARN of the budget auto-remediation Lambda function.
+    Value: !GetAtt BudgetEnforcementStack.Outputs.RemediationLambdaArn
+
+  ConfigBucketName:
+    Description: S3 bucket receiving AWS Config snapshots.
+    Value: !GetAtt BudgetEnforcementStack.Outputs.ConfigDeliveryBucketName
+
+  DeployedBudgets:
+    Description: Names of the three budget tiers deployed.
+    Value: !Sub >-
+      ${Environment}-budget-warning-50pct |
+      ${Environment}-budget-action-required-80pct |
+      ${Environment}-budget-breach-100pct
+
+  DeploymentSummary:
+    Description: Quick reference for what was deployed.
+    Value: !Sub >-
+      Env: ${Environment} |
+      Budget: $${MonthlyBudgetLimit}/mo |
+      Alerts: ${AlertEmail} |
+      Stacks: budget-enforcement, logging-audit, security-baseline, drift-detection

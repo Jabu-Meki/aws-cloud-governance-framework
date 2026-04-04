@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  This stack detects drift in nested stacks. It uses a Lambda function to compare the current state of the stack with the expected state defined in the CloudFormation template. If drift is detected, it sends an alert to an SNS topic.
+
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
+  ProjectTag:
+    Type: String
+
+  CostCenterTag:
+    Type: String
+
+  
+  AlertTopicArn:
+    Type: String
+    Description: Central SNS alert topic from budget enforcement stack
+
+
+  ConfigBucketName:
+    Type: String
+    Description: S3 bucket for Config to store drift detection results
+
+Resources:
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: SIX_HOURS
+      DataSources:
+        S3Logs:
+          Enable: true
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge rule - routes HIGH/CRITICAL Guardduty findings to SNS
+  GuardDutyFindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'guardduty-high-findings-${Environment}'
+      Description: "Route HIGH/CRITICAL GuardDuty findings to SNS"
+      State: ENABLED
+      EventPattern:
+        source:
+          - "aws.guardduty"
+        detail-type:
+          - "GuardDuty Finding"
+        detail:
+          severity:
+            - numeric:
+              - ">="
+              - 7
+
+      Targets:
+        - Id: SendToSNS
+          Arn: !Ref AlertTopicArn
+          InputTransformer:
+            InputPathsMap:
+              severity: "$.detail.severity"
+              type: "$.detail.type"
+              description: "$.detail.description"
+              region: "$.region"
+              account: "$.account"
+            InputTemplate: |
+              "GUARDDUTY FINDING | Severity: <severity> | Type: <type> | Description: <description> | Region: <region> | Account: <account>"
+
+
+  #Allow EventBridge to publish to the SNS topic
+
+  # S3 Auto remediation via ssm auto. config automatically calls S3 PutPublicAccessBlock on public S3 bucket.
+
+  SSMAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ssm-s3-remediation-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3RemediationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BlockS3PublicAccess
+                Effect: Allow
+                Action:
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                Resource: "arn:aws:s3:::*"
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # auto remediation fires when NON_COMPLIANT config rule is detected. It runs the SSM document to block public access on the bucket.
+  S3RemediationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 's3-public-access-remediation-${Environment}'
+      Description: >
+        Triggers SSM automation when Config detects a public S3 bucket.
+        Replaces AWS::Config::RemediationConfiguration which is not
+        supported as a CloudFormation resource type.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          messageType:
+            - ComplianceChangeNotification
+          configRuleName:
+            - !Sub 's3-block-public-access-${Environment}'
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Targets:
+        - Id: SSMAutomation
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}::automation-definition/AWS-DisableS3BucketPublicReadWrite'
+          RoleArn: !GetAtt SSMAutomationRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              bucketName: '$.detail.resourceId'
+            InputTemplate: !Sub >-
+              {"S3BucketName":[<bucketName>],
+              "AutomationAssumeRole":["${SSMAutomationRole.Arn}"]}
+
+  S3RemediationRulePermission:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'eventbridge-ssm-remediation-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartSSMAutomation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}::automation-definition/AWS-DisableS3BucketPublicReadWrite:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: !Sub 'account-analyzer-${Environment}'
+      Type: ACCOUNT
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessAnalyzerFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'access-analyzer-findings-${Environment}'
+      Description: Routes IAM Access Analyzer findings to SNS.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.access-analyzer
+        detail-type:
+          - Access Analyzer Finding
+      Targets:
+        - Id: SendToSNS
+          Arn: !Ref AlertTopicArn
+          InputTransformer:
+            InputPathsMap:
+              resourceType: '$.detail.resourceType'
+              resource: '$.detail.resource'
+            InputTemplate: |
+              "ACCESS ANALYZER FINDING | ResourceType: <resourceType> | Resource: <resource> | Review Security Hub for details."
+
+Outputs:
+  GuardDutyDetectorId:
+    Description: GuardDuty detector ID.
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDutyDetectorId'
+
+  AccessAnalyzerName:
+    Description: IAM Access Analyzer name.
+    Value: !Ref AccessAnalyzer
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessAnalyzerName'
+
+  SecurityHubConsoleUrl:
+    Description: Direct link to Security Hub findings.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/securityhub/home?region=${AWS::Region}#/findings'

@@ -42,6 +42,8 @@ Resources:
 
   AuditTrailBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub 'cloudtrail-logs-${AWS::AccountId}-${Environment}'
       VersioningConfiguration:
@@ -172,9 +174,9 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  
+
   # 2. CLOUDWATCH METRIC FILTERS + ALARMS
-  
+
   RootLoginFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -242,8 +244,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  #  2c. IAM policy changes 
-  
+  #  2c. IAM policy changes
+
   IAMPolicyChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -290,8 +292,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # --- 2d. CloudTrail configuration changes 
- 
+  # --- 2d. CloudTrail configuration changes
+
   CloudTrailChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -361,8 +363,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopicArn
 
-  # --- 2f. S3 bucket policy changes 
-  
+  # --- 2f. S3 bucket policy changes
+
   S3PolicyChangeFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -428,7 +430,7 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  # Athena workgroup 
+  # Athena workgroup
   AthenaWorkgroup:
     Type: AWS::Athena::WorkGroup
     Properties:
@@ -453,7 +455,7 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  # Glue database 
+  # Glue database
   AuditGlueDatabase:
     Type: AWS::Glue::Database
     Properties:

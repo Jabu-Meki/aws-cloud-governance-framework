@@ -8,26 +8,39 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+.env.*
 .venv/
 venv/
 cfn-lint-env/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+dist/
+build/
+*.egg-info/
 
 cdk.out/
 node_modules/
+.aws-sam/
 
 # macOS
 .DS_Store
 
 # Deployment artifacts
 packaged-*.yaml
+packaged-master.yaml
 samconfig.toml
+*.log
+*.tmp
+*.bak
 
 # Editors / local tooling
 .vscode/
 .idea/
 .codex
+.python-version
 
 # Terraform local state
 .terraform/

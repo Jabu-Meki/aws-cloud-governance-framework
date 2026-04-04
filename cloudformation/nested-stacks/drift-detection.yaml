@@ -1,0 +1,444 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Drift Detection Nested Stack — Cloud Cost Governance Framework
+  Detects CloudFormation stack drift on a daily schedule using
+  EventBridge + Lambda. Alerts via SNS when infrastructure no
+  longer matches its declared CloudFormation state.
+
+
+# PARAMETERS
+
+Parameters:
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
+  ProjectTag:
+    Type: String
+
+  CostCenterTag:
+    Type: String
+
+  AlertTopicArn:
+    Type: String
+    Description: Central SNS alert topic from budget-enforcement stack.
+
+  MasterStackName:
+    Type: String
+    Description: >
+      Name of the master stack to monitor for drift.
+      Passed from master-stack.yaml as governance-ENV.
+
+# RESOURCES
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # 1. S3 BUCKET — drift detection logs
+  # Every run writes a JSON report here — a history of when drift was
+  # introduced and resolved. An audit trail of infrastructure changes.
+  # ----------------------------------------------------------------------------
+  DriftLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'drift-logs-${AWS::AccountId}-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDriftLogs
+            Status: Enabled
+            ExpirationInDays: 180
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----------------------------------------------------------------------------
+  # 2. IAM ROLE — least privilege for drift detector
+  # Can read CloudFormation state and write to its own bucket.
+  # It detects drift — fixing it is a deliberate human action.
+  # ----------------------------------------------------------------------------
+  DriftDetectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'drift-detector-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DriftDetectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudFormationDriftDetection
+                Effect: Allow
+                Action:
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DetectStackResourceDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStacks
+                  - cloudformation:ListStackResources
+                  - cloudformation:DescribeStackResourceDrifts
+                Resource: '*'
+              - Sid: WriteDriftLogs
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${DriftLogsBucket.Arn}/*'
+              - Sid: PublishDriftAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopicArn
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub >-
+                  arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/drift-detector-${Environment}:*
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  
+  # 3. LAMBDA — drift detection function
+  # Runs daily. Checks all governance stacks. Sends alert if drift found.
+  # Writes a report to S3 every run regardless of result.
+  
+  DriftDetectorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'drift-detector-${Environment}'
+      Description: >
+        Daily drift detection for governance framework stacks.
+        Detects when infrastructure has been manually changed
+        outside of CloudFormation.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DriftDetectorRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          MASTER_STACK_NAME: !Ref MasterStackName
+          SNS_TOPIC_ARN: !Ref AlertTopicArn
+          DRIFT_LOGS_BUCKET: !Ref DriftLogsBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import boto3, json, os, time, logging
+          from datetime import datetime, timezone
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          cfn = boto3.client('cloudformation')
+          sns = boto3.client('sns')
+          s3  = boto3.client('s3')
+
+          MASTER_STACK      = os.environ['MASTER_STACK_NAME']
+          SNS_TOPIC_ARN     = os.environ['SNS_TOPIC_ARN']
+          DRIFT_LOGS_BUCKET = os.environ['DRIFT_LOGS_BUCKET']
+          ENVIRONMENT       = os.environ['ENVIRONMENT']
+
+          def get_all_governed_stacks():
+              stacks = []
+              try:
+                  cfn.describe_stacks(StackName=MASTER_STACK)
+                  stacks.append(MASTER_STACK)
+              except Exception as e:
+                  logger.warning(f"Master stack {MASTER_STACK} not found: {e}")
+                  return stacks
+              paginator = cfn.get_paginator('list_stacks')
+              for page in paginator.paginate(StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE']):
+                  for stack in page['StackSummaries']:
+                      name = stack['StackName']
+                      if MASTER_STACK in name and name != MASTER_STACK:
+                          stacks.append(name)
+              logger.info(f"Monitoring {len(stacks)} stacks: {stacks}")
+              return stacks
+
+          def initiate_drift_detection(stack_name):
+              try:
+                  response = cfn.detect_stack_drift(StackName=stack_name)
+                  return response['StackDriftDetectionId']
+              except Exception as e:
+                  logger.error(f"Could not start drift on {stack_name}: {e}")
+                  return None
+
+          def wait_for_result(stack_name, detection_id, max_wait=240):
+              start = time.time()
+              while time.time() - start < max_wait:
+                  response = cfn.describe_stack_drift_detection_status(
+                      StackDriftDetectionId=detection_id
+                  )
+                  status = response['DetectionStatus']
+                  if status in ['DETECTION_COMPLETE', 'DETECTION_FAILED']:
+                      return response
+                  time.sleep(10)
+              logger.warning(f"Drift detection timed out for {stack_name}")
+              return None
+
+          def get_drifted_resources(stack_name):
+              drifted = []
+              try:
+                  paginator = cfn.get_paginator('list_stack_resources')
+                  for page in paginator.paginate(StackName=stack_name):
+                      for r in page['StackResourceSummaries']:
+                          if r.get('DriftInformation', {}).get('StackResourceDriftStatus') == 'MODIFIED':
+                              drifted.append({
+                                  'LogicalId': r['LogicalResourceId'],
+                                  'Type': r['ResourceType'],
+                                  'PhysicalId': r.get('PhysicalResourceId', 'unknown')
+                              })
+              except Exception as e:
+                  logger.error(f"Could not get drifted resources: {e}")
+              return drifted
+
+          def write_report(report):
+              ts  = datetime.now(timezone.utc).strftime('%Y/%m/%d')
+              run = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+              key = f'drift-reports/{ts}/report-{run}.json'
+              s3.put_object(
+                  Bucket=DRIFT_LOGS_BUCKET, Key=key,
+                  Body=json.dumps(report, indent=2, default=str),
+                  ContentType='application/json'
+              )
+              logger.info(f"Report written to s3://{DRIFT_LOGS_BUCKET}/{key}")
+              return key
+
+          def send_alert(drifted_stacks, report_key):
+              total = sum(len(s.get('drifted_resources', [])) for s in drifted_stacks)
+              message = {
+                  'alert_type': 'INFRASTRUCTURE_DRIFT_DETECTED',
+                  'environment': ENVIRONMENT,
+                  'timestamp': datetime.now(timezone.utc).isoformat(),
+                  'summary': {
+                      'stacks_with_drift': len(drifted_stacks),
+                      'total_drifted_resources': total
+                  },
+                  'drifted_stacks': drifted_stacks,
+                  'full_report_s3': f's3://{DRIFT_LOGS_BUCKET}/{report_key}',
+                  'remediation_steps': [
+                      '1. Review drifted resources in CloudFormation console',
+                      '2. If change was intentional: update the CFN template',
+                      '3. If unintentional: redeploy to restore declared state',
+                      '4. Investigate who made the change via CloudTrail'
+                  ]
+              }
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject=f'[{ENVIRONMENT.upper()}] Drift Detected — {len(drifted_stacks)} stack(s) affected',
+                  Message=json.dumps(message, indent=2)
+              )
+
+          def handler(event, context):
+              logger.info(f"Drift detection run starting — environment: {ENVIRONMENT}")
+              run_time = datetime.now(timezone.utc).isoformat()
+
+              stacks = get_all_governed_stacks()
+              if not stacks:
+                  return {'statusCode': 200, 'body': 'No stacks found to monitor'}
+
+              # Start all drift detections first, then wait (parallel-ish)
+              detections = {}
+              for stack in stacks:
+                  did = initiate_drift_detection(stack)
+                  if did:
+                      detections[stack] = did
+
+              results = []
+              drifted_stacks = []
+              for stack_name, detection_id in detections.items():
+                  result = wait_for_result(stack_name, detection_id)
+                  if not result:
+                      continue
+                  drift_status = result.get('StackDriftStatus', 'UNKNOWN')
+                  entry = {
+                      'stack_name': stack_name,
+                      'drift_status': drift_status,
+                      'drifted_resource_count': result.get('DriftedStackResourceCount', 0),
+                      'drifted_resources': []
+                  }
+                  if drift_status == 'DRIFTED':
+                      entry['drifted_resources'] = get_drifted_resources(stack_name)
+                      drifted_stacks.append(entry)
+                  results.append(entry)
+
+              report_key = write_report({
+                  'run_timestamp': run_time,
+                  'environment': ENVIRONMENT,
+                  'stacks_checked': len(stacks),
+                  'stacks_drifted': len(drifted_stacks),
+                  'results': results
+              })
+
+              if drifted_stacks:
+                  send_alert(drifted_stacks, report_key)
+                  logger.warning(f"Drift found in {len(drifted_stacks)} stack(s).")
+              else:
+                  logger.info("Clean. All stacks match declared state.")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'stacks_checked': len(stacks),
+                      'stacks_drifted': len(drifted_stacks)
+                  })
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DriftDetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/drift-detector-${Environment}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  
+  #  EVENTBRIDGE SCHEDULE — daily trigger at 06:00 UTC
+  
+  DriftDetectionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'daily-drift-detection-${Environment}'
+      Description: Triggers drift detection daily at 06:00 UTC.
+      State: ENABLED
+      ScheduleExpression: 'cron(0 6 * * ? *)'
+      Targets:
+        - Id: DriftDetectorLambda
+          Arn: !GetAtt DriftDetectorLambda.Arn
+
+  DriftDetectorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DriftDetectorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DriftDetectionSchedule.Arn
+
+  # CLOUDFORMATION STACKSET — multi-region baseline
+
+  MultiRegionGovernanceStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      StackSetName: !Sub 'governance-multiregion-${Environment}'
+      Description: Lightweight governance monitoring across multiple regions.
+      PermissionModel: SELF_MANAGED
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      Parameters:
+        - ParameterKey: Environment
+          ParameterValue: !Ref Environment
+        - ParameterKey: ProjectTag
+          ParameterValue: !Ref ProjectTag
+      StackInstancesGroup:
+        - DeploymentTargets:
+            Accounts:
+              - !Ref AWS::AccountId
+          Regions:
+            - us-east-1
+            - us-west-2
+            - eu-west-1
+      OperationPreferences:
+        RegionConcurrencyType: PARALLEL
+        FailureToleranceCount: 2
+        MaxConcurrentCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+      TemplateBody: |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: Regional governance monitoring baseline (StackSet instance)
+        Parameters:
+          Environment:
+            Type: String
+          ProjectTag:
+            Type: String
+        Resources:
+          RegionalDriftAlarmPlaceholder:
+            Type: AWS::CloudWatch::Alarm
+            Properties:
+              AlarmName: !Sub 'regional-health-${Environment}'
+              AlarmDescription: Regional governance health check placeholder
+              Namespace: GovernanceFramework
+              MetricName: RegionalHealthCheck
+              Statistic: Sum
+              Period: 86400
+              EvaluationPeriods: 1
+              Threshold: 0
+              ComparisonOperator: GreaterThanThreshold
+              TreatMissingData: notBreaching
+        Outputs:
+          Region:
+            Value: !Ref AWS::Region
+            Description: Region this StackSet instance was deployed to
+
+# OUTPUTS
+
+Outputs:
+
+  DriftDetectorLambdaArn:
+    Description: ARN of the drift detection Lambda.
+    Value: !GetAtt DriftDetectorLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DriftDetectorArn'
+
+  DriftLogsBucketName:
+    Description: S3 bucket storing drift detection reports.
+    Value: !Ref DriftLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DriftLogsBucket'
+
+  StackSetName:
+    Description: Multi-region StackSet name.
+    Value: !Ref MultiRegionGovernanceStackSet
+    Export:
+      Name: !Sub '${AWS::StackName}-StackSetName'
+
+  ManualTriggerCommand:
+    Description: Run this to trigger drift detection immediately without waiting for the schedule.
+    Value: !Sub >-
+      aws lambda invoke --function-name drift-detector-${Environment}
+      --region ${AWS::Region} --payload '{}' /tmp/drift-result.json
+      && cat /tmp/drift-result.json
